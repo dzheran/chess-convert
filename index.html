@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Конвертер задач Lichess</title>
+<style>
+:root{color-scheme:light dark}
+body{font:18px/1.4 system-ui,sans-serif;max-width:40rem;margin:auto;padding:1rem}
+label{display:block;margin-top:1rem;font-weight:600}
+input,select,button{font:inherit;padding:.6rem;width:100%;box-sizing:border-box;margin-top:.3rem}
+button{margin-top:1rem}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/fzstd@0.1.1/umd/index.js"></script>
+</head>
+<body>
+<main>
+<h1>Конвертер задач Lichess</h1>
+<p>Бере файл lichess_db_puzzle.csv.zst і створює puzzles.json невеликими порціями.</p>
+
+<label for="src">1. Файл бази задач (.zst)</label>
+<input id="src" type="file">
+
+<label for="old">2. Існуючий puzzles.json, щоб додати до нього (необов'язково)</label>
+<input id="old" type="file" accept=".json,application/json">
+
+<label for="start">Почати після рядка номер</label>
+<input id="start" type="number" min="0" value="0" inputmode="numeric">
+
+<label for="rmin">Рейтинг від</label>
+<input id="rmin" type="number" value="600" inputmode="numeric">
+
+<label for="rmax">Рейтинг до</label>
+<input id="rmax" type="number" value="2500" inputmode="numeric">
+
+<label for="pop">Мінімальна популярність (від -100 до 100)</label>
+<input id="pop" type="number" value="80" inputmode="numeric">
+
+<button id="scan">Порахувати, скільки є задач</button>
+<p id="scanstatus" role="status" aria-live="polite"></p>
+<section id="result" aria-label="Результат підрахунку" hidden>
+  <h2>Скільки є задач</h2>
+  <p id="total"></p>
+  <h3>За рейтингом (з урахуванням популярності)</h3>
+  <ul id="bands"></ul>
+  <h3>За темами (з урахуванням рейтингу й популярності)</h3>
+  <ul id="themelist"></ul>
+</section>
+
+<label for="theme">Тема (заповнюється після підрахунку)</label>
+<select id="theme"><option value="">Усі теми</option></select>
+<label for="extra">Інші тактичні теги в задачі</label>
+<select id="extra">
+<option value="">Будь-які</option>
+<option value="0">Жодних (лише ця тема)</option>
+<option value="1">Не більше 1 іншого</option>
+<option value="2">Не більше 2 інших</option>
+</select>
+<p id="avail" aria-live="polite"></p>
+
+<label for="count">Скільки задач додати</label>
+<input id="count" type="number" min="1" value="500" inputmode="numeric">
+
+<button id="go">Витягти задачі</button>
+<button id="stop">Зупинити</button>
+<p id="prog"></p>
+<p id="status" role="status" aria-live="polite"></p>
+
+<button id="dl" disabled>Завантажити puzzles.json</button>
+<button id="cp" disabled>Скопіювати JSON</button>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let puzzles = [], seen = new Set(), busy = false, cancel = false;
+let themeCounts = {}, themeExtra = {}, totalMatch = 0;
+// Службові теги: не є тактичним прийомом (стадія гри, довжина, оцінка, джерело)
+const META = new Set(['opening','middlegame','endgame','oneMove','short','long','veryLong','crushing','advantage','equality','master','masterVsMaster','superGM']);
+const isMateN = x => /^mateIn\d$/.test(x);
+const isMatePattern = x => /[a-z]Mate$/.test(x);
+// Скільки ІНШИХ тактичних тегів має задача, крім обраної теми.
+// Не рахуємо: 'mate' (його мають усі види мату) і mateInN (це лише довжина), якщо вони не обрані.
+function othersFrom(t0, spec, nN, theme) {
+  let k = t0.length - (t0.includes(theme) ? 1 : 0);
+  if (spec && theme !== 'mate' && t0.includes('mate')) k--;
+  if (!isMateN(theme)) k -= nN;
+  return k;
+}
+function prep(th) {
+  const t0 = th.filter(x => x && !META.has(x));
+  return [t0, t0.some(x => isMateN(x) || isMatePattern(x)), t0.filter(isMateN).length];
+}
+const themeOk = (th, theme, extra) => {
+  if (!theme) return true;
+  if (!th.includes(theme)) return false;
+  if (extra === '') return true;
+  const [t0, spec, nN] = prep(th);
+  return othersFrom(t0, spec, nN, theme) <= +extra;
+};
+const say = t => { $('status').textContent = t; };
+const sayScan = t => { $('scanstatus').textContent = t; };
+
+// Спільне читання .zst: onRow(рядок, номер) повертає true, щоб зупинитись
+async function stream(f, onRow, onProg) {
+  let row = 0, tail = '', stop = false, ended = false, read = 0;
+  const td = new TextDecoder();
+  const handle = (chunk, final) => {
+    if (stop) return;
+    tail += td.decode(chunk, { stream: !final });
+    const lines = tail.split('\n');
+    tail = lines.pop();
+    if (final && tail) { lines.push(tail); tail = ''; }
+    for (const l of lines) {
+      if (stop) break;
+      if (!l || l.startsWith('PuzzleId')) continue;
+      row++;
+      if (onRow(l, row) === true) stop = true;
+    }
+  };
+  const d = new fzstd.Decompress(handle);
+  const rd = f.stream().getReader();
+  while (!stop && !cancel) {
+    const r = await rd.read();
+    if (r.done) { d.push(new Uint8Array(0), true); ended = true; break; }
+    d.push(r.value);
+    read += r.value.length;
+    onProg(Math.floor(read / f.size * 100), row);
+    await new Promise(r => setTimeout(r));
+  }
+  rd.cancel();
+  return { row, ended, stopped: cancel };
+}
+
+$('stop').onclick = () => { cancel = true; };
+
+// Номер рядка "почати після" діє лише для тих самих фільтрів, з якими він був отриманий
+let lastKey = null;
+const keyNow = () => [$('rmin').value, $('rmax').value, $('pop').value, $('theme').value, $('extra').value].join('|');
+['rmin', 'rmax', 'pop', 'theme', 'extra'].forEach(id => $(id).addEventListener('change', () => {
+  if (lastKey !== null && keyNow() !== lastKey && +$('start').value !== 0) {
+    $('start').value = 0;
+    say('Фільтри змінено, тому «Почати після рядка» скинуто на 0.');
+  }
+}));
+
+$('old').onchange = async e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  try {
+    const a = JSON.parse(await f.text());
+    puzzles = a;
+    seen = new Set(a.map(p => p.id));
+    $('dl').disabled = $('cp').disabled = !a.length;
+    say('Завантажено ' + a.length + ' задач з існуючого файлу.');
+  } catch { say('Не вдалося прочитати puzzles.json.'); }
+};
+
+$('extra').onchange = () => $('theme').onchange();
+$('theme').onchange = () => {
+  const t = $('theme').value;
+  const e = $('extra').value;
+  const n = !t ? totalMatch : (e === '' ? (themeCounts[t] || 0) : ((themeExtra[t] || [])[+e] || 0));
+  $('avail').textContent = Object.keys(themeCounts).length
+    ? 'Доступно з такими налаштуваннями: ' + n + '. Можна вказати до ' + n + '.'
+    : '';
+};
+
+$('scan').onclick = async () => {
+  const f = $('src').files[0];
+  if (!f) { sayScan('Спочатку обери файл .zst'); return; }
+  if (busy) return;
+  busy = true; cancel = false;
+  const start = +$('start').value;
+  const rmin = +$('rmin').value, rmax = +$('rmax').value, pop = +$('pop').value;
+  const bands = {}, themes = {}, extraC = {};
+  let matched = 0;
+
+  sayScan('Рахую… це може тривати кілька хвилин.');
+  try {
+    const res = await stream(f, (l, row) => {
+      if (row <= start) return;
+      const c = l.split(',');
+      const rating = +c[3], popularity = +c[5];
+      if (popularity < pop || seen.has(c[0])) return;
+      const b = Math.floor(rating / 200) * 200;
+      bands[b] = (bands[b] || 0) + 1;
+      if (rating < rmin || rating > rmax) return;
+      matched++;
+      const th = (c[7] || '').trim().split(' ');
+      for (const t of th) {
+        if (t) themes[t] = (themes[t] || 0) + 1;
+      }
+      const [t0, spec, nN] = prep(th);
+      for (const t of th) {
+        if (!t) continue;
+        const k = othersFrom(t0, spec, nN, t);
+        const a = extraC[t] || (extraC[t] = [0, 0, 0]);
+        for (let j = Math.max(k, 0); j < 3; j++) a[j]++;
+      }
+    }, (pct, row) => {
+      $('prog').textContent = 'Прочитано ' + pct + '%, рядків переглянуто: ' + row;
+    });
+
+    themeCounts = themes; themeExtra = extraC; totalMatch = matched;
+
+    $('total').textContent = 'Рахував після рядка ' + start + '. Усього підходить під рейтинг ' + rmin + '–' + rmax +
+      ' і популярність від ' + pop + ': ' + matched + ' задач.';
+
+    $('bands').innerHTML = '';
+    Object.keys(bands).map(Number).sort((a, b) => a - b).forEach(b => {
+      const li = document.createElement('li');
+      li.textContent = b + '–' + (b + 199) + ': ' + bands[b];
+      $('bands').appendChild(li);
+    });
+
+    const lbl = t => { const a = extraC[t] || [0, 0, 0]; return 'без інших: ' + a[0] + ', до 1 іншого: ' + a[1] + ', до 2: ' + a[2]; };
+    const names = Object.keys(themes).sort((a, b) => themes[b] - themes[a]);
+    $('themelist').innerHTML = '';
+    const sel = $('theme'), prev = sel.value;
+    sel.innerHTML = '';
+    const all = document.createElement('option');
+    all.value = ''; all.textContent = 'Усі теми — ' + matched;
+    sel.appendChild(all);
+    names.forEach(t => {
+      const li = document.createElement('li');
+      li.textContent = t + ': ' + themes[t] + ' (' + lbl(t) + ')';
+      $('themelist').appendChild(li);
+      const o = document.createElement('option');
+      o.value = t; o.textContent = t + ' — ' + themes[t] + ' (' + lbl(t) + ')';
+      sel.appendChild(o);
+    });
+    if (names.includes(prev)) sel.value = prev;
+    $('theme').onchange();
+    $('result').hidden = false;
+
+    sayScan(res.stopped
+      ? 'Зупинено. Підрахунок неповний: ' + matched + ' задач у переглянутій частині.'
+      : 'Підрахунок завершено. Підходить ' + matched + ' задач, тем: ' + names.length + '.');
+  } catch (e) {
+    sayScan('Помилка: ' + e.message);
+  }
+  cancel = false; busy = false;
+};
+
+$('go').onclick = async () => {
+  const f = $('src').files[0];
+  if (!f) { say('Спочатку обери файл .zst'); return; }
+  if (busy) return;
+  busy = true; cancel = false;
+  const start = +$('start').value, want = +$('count').value;
+  const rmin = +$('rmin').value, rmax = +$('rmax').value, pop = +$('pop').value;
+  const theme = $('theme').value, extra = $('extra').value;
+  const key = keyNow();
+  let added = 0;
+
+  say('Працюю…');
+  try {
+    const res = await stream(f, (l, row) => {
+      if (row <= start) return;
+      const c = l.split(',');
+      const rating = +c[3], popularity = +c[5];
+      if (rating < rmin || rating > rmax || popularity < pop || seen.has(c[0])) return;
+      const th = (c[7] || '').trim().split(' ');
+      if (!themeOk(th, theme, extra)) return;
+      seen.add(c[0]);
+      puzzles.push({ id: c[0], fen: c[1], moves: c[2].split(' '), rating, themes: th });
+      if (++added >= want) return true;
+    }, (pct, row) => {
+      $('prog').textContent = 'Прочитано ' + pct + '%, рядків переглянуто: ' + row + ', додано: ' + added;
+    });
+
+    lastKey = key;
+    $('start').value = res.ended ? 0 : res.row;
+    $('dl').disabled = $('cp').disabled = !puzzles.length;
+    say('Готово. Додано ' + added + ', всього в наборі ' + puzzles.length + '. ' +
+      (res.ended
+        ? 'Файл закінчився' + (start > 0 ? ' (шукав після рядка ' + start + ', поле скинуто на 0)' : '') + '.'
+        : 'Наступного разу починай після рядка ' + res.row + ' (поле вже заповнене).') +
+      (puzzles.length ? ' Тепер можна завантажити puzzles.json.' : ''));
+  } catch (e) {
+    say('Помилка: ' + e.message);
+  }
+  cancel = false; busy = false;
+};
+
+$('dl').onclick = () => {
+  const b = new Blob([JSON.stringify(puzzles)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(b);
+  a.download = 'puzzles.json';
+  a.click();
+};
+
+$('cp').onclick = async () => {
+  try { await navigator.clipboard.writeText(JSON.stringify(puzzles)); say('JSON скопійовано.'); }
+  catch { say('Не вдалося скопіювати.'); }
+};
+</script>
+</body>
+</html>
